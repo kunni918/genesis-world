@@ -1539,11 +1539,28 @@ class Scene(RBC):
     def _sanitize_envs_idx(
         self, envs_idx: int | range | slice | tuple[int, ...] | list[int] | torch.Tensor | np.ndarray | None
     ) -> torch.Tensor:
+        def sanitize_bool_mask(mask) -> torch.Tensor:
+            mask = torch.as_tensor(mask, dtype=torch.bool, device=self._envs_idx.device)
+            if mask.ndim != 1 or len(mask) != self.n_envs:
+                gs.raise_exception(
+                    f"Invalid shape: {mask.shape}. Expecting 1D boolean mask of length {self.n_envs} for `envs_idx`."
+                )
+            return self._envs_idx[mask]
+
         if envs_idx is None:
             return self._envs_idx
 
         if self.n_envs == 0:
             gs.raise_exception("`envs_idx` is not supported for non-parallelized scene.")
+
+        if isinstance(envs_idx, torch.Tensor) and envs_idx.dtype == torch.bool:
+            return sanitize_bool_mask(envs_idx)
+        if isinstance(envs_idx, np.ndarray) and envs_idx.dtype == np.bool_:
+            return sanitize_bool_mask(envs_idx)
+        if isinstance(envs_idx, (tuple, list)) and envs_idx and all(
+            isinstance(idx, (bool, np.bool_)) for idx in envs_idx
+        ):
+            return sanitize_bool_mask(envs_idx)
 
         if isinstance(envs_idx, (slice, range)):
             return self._envs_idx[envs_idx]

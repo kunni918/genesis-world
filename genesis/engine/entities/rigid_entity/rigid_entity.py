@@ -3084,9 +3084,17 @@ class RigidEntity(KinematicEntity):
         is_invalid: torch.Tensor
             A tensor of boolean mask indicating the batch indices with failed plan.
         """
+        if qpos_goal is None:
+            gs.raise_exception("`qpos_goal` must be specified.")
+
         if self._solver.n_envs > 0:
-            n_envs = len(self._scene._sanitize_envs_idx(envs_idx))
+            envs_idx = self._scene._sanitize_envs_idx(envs_idx)
+            if envs_idx.dtype == torch.bool:
+                envs_idx = torch.nonzero(envs_idx, as_tuple=False).flatten().to(dtype=gs.tc_int, device=gs.device)
+            n_envs = len(envs_idx)
         else:
+            if envs_idx is not None:
+                gs.raise_exception("`envs_idx` is only supported for batched scenes.")
             n_envs = 1
 
         if "ignore_joint_limit" in kwargs:
@@ -3094,11 +3102,16 @@ class RigidEntity(KinematicEntity):
 
         ee_link_idx = None
         if ee_link_name is not None:
-            assert with_entity is not None, "`with_entity` must be specified."
+            if with_entity is None:
+                gs.raise_exception("`with_entity` must be specified.")
             ee_link_idx = self.get_link(ee_link_name).idx
         if with_entity is not None:
-            assert ee_link_name is not None, "reference link of the robot must be specified."
-            assert len(with_entity.links) == 1, "only non-articulated object is supported for now."
+            if ee_link_name is None:
+                gs.raise_exception("reference link of the robot must be specified.")
+            if with_entity._solver is not self._solver:
+                gs.raise_exception("`with_entity` must belong to the same scene as the planning entity.")
+            if len(with_entity.links) != 1:
+                gs.raise_exception("only non-articulated object is supported for now.")
 
         # import here to avoid circular import
         from genesis.utils.path_planning import RRT, RRTConnect
@@ -3111,38 +3124,90 @@ class RigidEntity(KinematicEntity):
             case _:
                 gs.raise_exception(f"invalid planner {planner} specified.")
 
-        path = torch.empty((num_waypoints, n_envs, self.n_qs), dtype=gs.tc_float, device=gs.device)
-        is_invalid = torch.ones((n_envs,), dtype=torch.bool, device=gs.device)
-        for i in range(1 + max_retry):
-            retry_path, retry_is_invalid = planner_obj.plan(
-                qpos_goal,
-                qpos_start=qpos_start,
-                resolution=resolution,
-                timeout=timeout,
-                max_nodes=max_nodes,
-                smooth_path=smooth_path,
-                num_waypoints=num_waypoints,
-                ignore_collision=ignore_collision,
-                envs_idx=envs_idx,
-                ee_link_idx=ee_link_idx,
-                obj_entity=with_entity,
-            )
-            # NOTE: update the previously failed path with the new results
-            path[:, is_invalid] = retry_path[:, is_invalid]
-
-            is_invalid &= retry_is_invalid
-            if not is_invalid.any():
-                break
-            gs.logger.info(f"Planning failed. Retrying for {is_invalid.sum()} environments...")
-
-        if self._solver.n_envs == 0:
+        is_plan_with_obj = ee_link_idx is not None and with_entity is not None
+        if self._solver.n_envs > 0 and n_envs == 0:
+            path = torch.empty((num_waypoints, 0, self.n_qs), dtype=gs.tc_float, device=gs.device)
             if return_valid_mask:
-                return path.squeeze(1), ~is_invalid[0]
-            return path.squeeze(1)
+                return path, torch.empty((0,), dtype=torch.bool, device=gs.device)
+            return path
 
-        if return_valid_mask:
-            return path, ~is_invalid
-        return path
+        qpos_cur = None
+        obj_state = None
+        hibernation_state = None
+        collider_state = None
+        constraint_state = None
+        errno_state = None
+        if is_plan_with_obj:
+            qpos_cur = self.get_qpos(envs_idx=envs_idx).clone()
+            obj_state = planner_obj.snapshot_entity_state(with_entity, envs_idx)
+            hibernation_state = planner_obj.snapshot_hibernation_state()
+            collider_state = planner_obj.snapshot_collider_state()
+            constraint_state = planner_obj.snapshot_constraint_state()
+            errno_state = planner_obj.snapshot_errno_state()
+
+        planner_error = None
+        try:
+            path = torch.empty((num_waypoints, n_envs, self.n_qs), dtype=gs.tc_float, device=gs.device)
+            is_invalid = torch.ones((n_envs,), dtype=torch.bool, device=gs.device)
+            for i in range(1 + max_retry):
+                if i > 0 and is_plan_with_obj:
+                    planner_obj.restore_planning_state(
+                        qpos_cur,
+                        envs_idx,
+                        with_entity,
+                        obj_state,
+                        collider_state,
+                        hibernation_state,
+                        constraint_state,
+                        errno_state,
+                    )
+
+                retry_path, retry_is_invalid = planner_obj.plan(
+                    qpos_goal,
+                    qpos_start=qpos_start,
+                    resolution=resolution,
+                    timeout=timeout,
+                    max_nodes=max_nodes,
+                    smooth_path=smooth_path,
+                    num_waypoints=num_waypoints,
+                    ignore_collision=ignore_collision,
+                    envs_idx=envs_idx,
+                    ee_link_idx=ee_link_idx,
+                    obj_entity=with_entity,
+                    restore_state=not is_plan_with_obj,
+                )
+                # NOTE: update the previously failed path with the new results
+                path[:, is_invalid] = retry_path[:, is_invalid]
+
+                is_invalid &= retry_is_invalid
+                if not is_invalid.any():
+                    break
+                gs.logger.info(f"Planning failed. Retrying for {is_invalid.sum()} environments...")
+
+            if self._solver.n_envs == 0:
+                if return_valid_mask:
+                    return path.squeeze(1), ~is_invalid[0]
+                return path.squeeze(1)
+
+            if return_valid_mask:
+                return path, ~is_invalid
+            return path
+        except BaseException as exc:
+            planner_error = exc
+            raise
+        finally:
+            if is_plan_with_obj:
+                planner_obj.restore_planning_state(
+                    qpos_cur,
+                    envs_idx,
+                    with_entity,
+                    obj_state,
+                    collider_state,
+                    hibernation_state,
+                    constraint_state,
+                    errno_state,
+                    planner_error=planner_error,
+                )
 
     # ------------------------------------------------------------------------------------
     # ---------------------------------- control & io ------------------------------------
