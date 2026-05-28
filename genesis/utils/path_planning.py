@@ -1,6 +1,7 @@
 import dataclasses
 import time
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 import quadrants as qd
@@ -17,10 +18,6 @@ if TYPE_CHECKING:
 
 
 _QD_STATE_TYPES = (qd.Tensor, qd.Field)
-
-
-class PlannerStateRestoreError(RuntimeError):
-    """Raised when a planner transaction cannot restore the scene state."""
 
 
 class PathPlanner(ABC):
@@ -41,7 +38,22 @@ class PathPlanner(ABC):
         self,
         qpos_goal,
         qpos_start=None,
-    ): ...
+        resolution=0.05,
+        timeout=None,
+        max_nodes=2000,
+        smooth_path=True,
+        num_waypoints=100,
+        ignore_collision=False,
+        ee_link_idx=None,
+        obj_entity=None,
+        envs_idx=None,
+    ):
+        """
+        Plan a path from `qpos_start` to `qpos_goal` for `self._entity`. Each call snapshots and
+        restores live solver state when `obj_entity` is provided, so the live scene is unchanged
+        whether the planner succeeds, fails, or raises.
+        """
+        ...
 
     def get_link_pose(self, robot_g_link_idx, obj_g_link_idx, envs_idx):
         """
@@ -99,40 +111,33 @@ class PathPlanner(ABC):
 
         return pos, quat, dofs_velocity
 
-    def is_partial_envs_idx(self, envs_idx):
-        if self._solver.n_envs == 0:
-            return False
-
-        envs_idx = self._solver._scene._sanitize_envs_idx(envs_idx)
-        if envs_idx.dtype == torch.bool:
-            return not bool(envs_idx.all())
-        return len(envs_idx) != self._solver.n_envs
-
-    def can_restore_base_pose(self, entity, pos, quat, envs_idx):
-        if (
+    def _assert_can_restore_base_pose(self, entity, pos, quat, envs_idx):
+        # Fixed entities with non-batched vertices share one pose across envs and cannot be restored
+        # for a strict subset; allow the restore only when the current pose already matches.
+        if not (
             self._solver.n_envs > 0
             and entity.base_link.is_fixed
             and not entity._batch_fixed_verts
-            and self.is_partial_envs_idx(envs_idx)
+            and len(envs_idx) != self._solver.n_envs
         ):
-            current_pos = entity.get_pos(envs_idx=envs_idx)
-            current_quat = entity.get_quat(envs_idx=envs_idx)
-            if not (
-                torch.allclose(current_pos, pos, rtol=0.0, atol=gs.EPS)
-                and torch.allclose(current_quat, quat, rtol=0.0, atol=gs.EPS)
-            ):
-                gs.raise_exception(
-                    "Cannot restore env-specific pose for a fixed object with non-batched fixed vertices. "
-                    "Set morph option `batch_fixed_verts=True` or plan across all environments."
-                )
-            return False
+            return True
 
-        return True
+        current_pos = entity.get_pos(envs_idx=envs_idx)
+        current_quat = entity.get_quat(envs_idx=envs_idx)
+        if not (
+            torch.allclose(current_pos, pos, rtol=0.0, atol=gs.EPS)
+            and torch.allclose(current_quat, quat, rtol=0.0, atol=gs.EPS)
+        ):
+            gs.raise_exception(
+                "Cannot restore env-specific pose for a fixed object with non-batched fixed vertices. "
+                "Set morph option `batch_fixed_verts=True` or plan across all environments."
+            )
+        return False
 
     def restore_entity_state(self, entity, state, envs_idx):
         pos, quat, dofs_velocity = state
         obj_link_idx = entity.base_link_idx
-        can_restore_base_pose = self.can_restore_base_pose(entity, pos, quat, envs_idx)
+        can_restore_base_pose = self._assert_can_restore_base_pose(entity, pos, quat, envs_idx)
 
         if self._solver.n_envs > 0:
             if can_restore_base_pose:
@@ -176,34 +181,23 @@ class PathPlanner(ABC):
     def normalize_envs_idx(self, envs_idx):
         if self._solver.n_envs == 0:
             return envs_idx
-
-        envs_idx = self._solver._scene._sanitize_envs_idx(envs_idx)
-        if envs_idx.dtype == torch.bool:
-            envs_idx = torch.nonzero(envs_idx, as_tuple=False).flatten().to(dtype=gs.tc_int, device=gs.device)
-        return envs_idx
-
-    def snapshot_errno_state(self):
-        return self.snapshot_tensor_state([self._solver._errno])
-
-    def restore_errno_state(self, state):
-        self.restore_tensor_state(state)
+        # `_sanitize_envs_idx` already maps bool masks to integer indices.
+        return self._solver._scene._sanitize_envs_idx(envs_idx)
 
     def iter_constraint_state_tensors(self, constraint_solver):
         constraint_state = getattr(constraint_solver, "constraint_state", None)
         if self._solver._use_contact_island:
-            tensor = getattr(constraint_solver, "qacc_ws", None)
-            if tensor is None and constraint_state is not None:
-                tensor = getattr(constraint_state, "qacc_ws", None)
-            if tensor is not None:
-                yield tensor
-
-            tensor = getattr(constraint_solver, "is_warmstart", None)
-            if tensor is None and constraint_state is not None:
-                tensor = getattr(constraint_state, "is_warmstart", None)
-            if tensor is not None:
-                yield tensor
-
-            for name in ("n_constraints", "n_constraints_equality", "n_constraints_frictionloss", "qd_n_equalities"):
+            # `ConstraintSolverIsland` rebuilds the heavy constraint matrices on every step from the
+            # contact island state, but it keeps `qacc_ws`/`is_warmstart` and a few counters across
+            # steps. Restore only those — the Jacobian/Cholesky scratch is regenerated.
+            for name in (
+                "qacc_ws",
+                "is_warmstart",
+                "n_constraints",
+                "n_constraints_equality",
+                "n_constraints_frictionloss",
+                "qd_n_equalities",
+            ):
                 tensor = getattr(constraint_solver, name, None)
                 if tensor is None and constraint_state is not None:
                     tensor = getattr(constraint_state, name, None)
@@ -211,18 +205,10 @@ class PathPlanner(ABC):
                     yield tensor
             return
 
-        if hasattr(constraint_solver, "_eq_const_info_cache"):
-            constraint_state = constraint_solver.constraint_state
-            yield constraint_state.is_warmstart
-            yield constraint_state.qacc_ws
-
-        else:
-            if constraint_state is not None:
-                yield from self.iter_state_tensors(constraint_state)
-
-            for value in vars(constraint_solver).values():
-                if isinstance(value, _QD_STATE_TYPES):
-                    yield value
+        # `ConstraintSolver` (non-island) only keeps `qacc_ws`/`is_warmstart` between steps; the rest
+        # is rebuilt from `_eq_const_info_cache` on demand.
+        yield constraint_state.is_warmstart
+        yield constraint_state.qacc_ws
 
     def snapshot_constraint_state(self):
         constraint_solver = self._solver.constraint_solver
@@ -264,6 +250,8 @@ class PathPlanner(ABC):
         self._solver.collider._contact_data_cache.clear()
 
     def snapshot_hibernation_state(self):
+        # Honor the user request even if `_use_hibernation` was downgraded to False because
+        # `use_contact_island=False`; the underlying buffers still exist and may be mutated.
         if not (self._solver._use_hibernation or self._solver._options.use_hibernation):
             return None
 
@@ -287,83 +275,95 @@ class PathPlanner(ABC):
             tensors.extend(self.iter_state_tensors(contact_island.contact_island_state))
         return self.snapshot_tensor_state(tensors)
 
-    def restore_hibernation_state(self, state):
-        self.restore_tensor_state(state)
+    @contextmanager
+    def _planning_transaction(self, qpos_cur, envs_idx, obj_entity):
+        """
+        Context manager that snapshots all solver state the planner can mutate and restores it on
+        normal return AND on any exception, including KeyboardInterrupt/SystemExit. Per-section
+        restore failures are aggregated so one broken restore does not skip the others. On normal
+        return, the first restore failure is raised; on an in-flight planner exception, restore
+        failures are logged so they do not mask the planner exception.
+        """
+        obj_state = None
+        collider_state = None
+        hibernation_state = None
+        constraint_state = None
+        errno_state = None
+        if obj_entity is not None:
+            obj_state = self.snapshot_entity_state(obj_entity, envs_idx)
+            hibernation_state = self.snapshot_hibernation_state()
+            collider_state = self.snapshot_collider_state()
+            constraint_state = self.snapshot_constraint_state()
+            errno_state = self.snapshot_tensor_state([self._solver._errno])
 
-    def restore_planning_state(
-        self,
-        qpos_cur,
-        envs_idx,
-        obj_entity=None,
-        obj_state=None,
-        collider_state=None,
-        hibernation_state=None,
-        constraint_state=None,
-        errno_state=None,
-        *,
-        planner_error=None,
-    ):
-        errors = []
-
+        # Track an in-flight planner exception via `try/except BaseException; raise` so that the
+        # finally clause can distinguish a normal exit from an exception unwind. Using
+        # `sys.exc_info()` inside the finally is unsafe: if the caller invokes `plan_path` from
+        # inside its own `except` block, `sys.exc_info()` would report the OUTER exception and
+        # silently mask restore failures here.
+        #
+        # The outer `try:` is purely stylistic — a flat `try/except BaseException as exc: ...;
+        # raise; finally: ...` is functionally identical. The nested form is chosen to visually
+        # separate the planner-error capture from the restore steps; collapse if you prefer.
+        planner_error: BaseException | None = None
         try:
+            try:
+                yield
+            except BaseException as exc:
+                planner_error = exc
+                raise
+        finally:
+            errors: list[tuple[str, BaseException]] = []
+
+            def attempt(scope, fn):
+                # Catch `BaseException` (not just `Exception`) so a signal raised inside a restore
+                # step does not skip the remaining steps and silently replace `planner_error` with
+                # itself. If a `BaseException`-non-`Exception` is caught here it is still re-raised
+                # at the end, after every restore has had a chance to run.
+                try:
+                    fn()
+                except BaseException as exc:
+                    errors.append((scope, exc))
+
+            # Order matters: hibernation rebuilds awake buffers that the collider/constraint
+            # snapshots are keyed against.
             if self._solver.n_envs > 0:
-                self._entity.set_qpos(qpos_cur, envs_idx=envs_idx, zero_velocity=False)
+                attempt(
+                    "robot qpos",
+                    lambda: self._entity.set_qpos(qpos_cur, envs_idx=envs_idx, zero_velocity=False),
+                )
             else:
-                self._entity.set_qpos(qpos_cur, zero_velocity=False)
-        except Exception as exc:
-            errors.append(("robot qpos", exc))
+                attempt("robot qpos", lambda: self._entity.set_qpos(qpos_cur, zero_velocity=False))
+            if obj_entity is not None and obj_state is not None:
+                attempt("object state", lambda: self.restore_entity_state(obj_entity, obj_state, envs_idx))
+            if hibernation_state is not None:
+                attempt("hibernation state", lambda: self.restore_tensor_state(hibernation_state))
+            if collider_state is not None:
+                attempt("collider state", lambda: self.restore_collider_state(collider_state))
+            if constraint_state is not None:
+                attempt("constraint state", lambda: self.restore_constraint_state(constraint_state))
+            if errno_state is not None:
+                attempt("errno state", lambda: self.restore_tensor_state(errno_state))
 
-        if obj_entity is not None and obj_state is not None:
-            try:
-                self.restore_entity_state(obj_entity, obj_state, envs_idx)
-            except Exception as exc:
-                errors.append(("object state", exc))
-
-        # Collision detection still updates solver runtime globally; restore runtime snapshots as full-batch state.
-        if hibernation_state is not None:
-            try:
-                self.restore_hibernation_state(hibernation_state)
-            except Exception as exc:
-                errors.append(("hibernation state", exc))
-
-        if collider_state is not None:
-            try:
-                self.restore_collider_state(collider_state)
-            except Exception as exc:
-                errors.append(("collider state", exc))
-
-        if constraint_state is not None:
-            try:
-                self.restore_constraint_state(constraint_state)
-            except Exception as exc:
-                errors.append(("constraint state", exc))
-
-        if errno_state is not None:
-            try:
-                self.restore_errno_state(errno_state)
-            except Exception as exc:
-                errors.append(("errno state", exc))
-
-        if errors:
-            message = "; ".join(f"{scope}: {exc}" for scope, exc in errors)
-            if planner_error is not None:
-                if hasattr(planner_error, "add_note"):
-                    planner_error.add_note(f"Planner state restore failed after planner error: {message}")
+            if errors:
+                # A `BaseException`-non-`Exception` (e.g. KeyboardInterrupt) must always win over
+                # a regular Exception, both with and without an in-flight planner exception.
+                base_errors = [e for _, e in errors if not isinstance(e, Exception)]
+                if planner_error is not None:
+                    for scope, exc in errors:
+                        gs.logger.warning(f"Planner state restore failed ({scope}): {exc}")
+                    if base_errors:
+                        raise base_errors[0]
+                elif base_errors:
+                    for scope, exc in errors:
+                        if exc is base_errors[0]:
+                            continue
+                        gs.logger.warning(f"Additional planner restore error ({scope}): {exc}")
+                    raise base_errors[0]
                 else:
-                    gs.logger.warning(f"Planner state restore failed after planner error: {message}")
-                if not isinstance(planner_error, Exception):
-                    return
-                raise PlannerStateRestoreError(
-                    f"Planner state restore failed after planner error: {message}"
-                ) from planner_error
-
-            first_error = errors[0][1]
-            for scope, exc in errors[1:]:
-                if hasattr(first_error, "add_note"):
-                    first_error.add_note(f"Additional planner restore error ({scope}): {exc}")
-                else:
-                    gs.logger.warning(f"Additional planner restore error ({scope}): {exc}")
-            raise first_error
+                    for scope, exc in errors[1:]:
+                        gs.logger.warning(f"Additional planner restore error ({scope}): {exc}")
+                    raise errors[0][1]
 
     # ------------------------------------------------------------------------------------
     # ------------------------------ util funcs ------------------------------------------
@@ -390,12 +390,14 @@ class PathPlanner(ABC):
         if (ee_link_idx is None) != (obj_entity is None):
             gs.raise_exception("`ee_link_idx` and `obj_entity` must be specified together.")
         if obj_entity is not None:
+            if obj_entity is self._entity:
+                gs.raise_exception("`obj_entity` cannot be the planning entity itself.")
             if obj_entity._solver is not self._solver:
                 gs.raise_exception("`obj_entity` must belong to the same scene as the planning entity.")
             if not any(link.idx == ee_link_idx for link in self._entity.links):
                 gs.raise_exception("`ee_link_idx` must belong to the planning entity.")
             if len(obj_entity.links) != 1:
-                gs.raise_exception("only non-articulated object is supported for now.")
+                gs.raise_exception("Only non-articulated objects are supported for now.")
 
     def _empty_plan_result(self, num_waypoints):
         path = torch.empty((num_waypoints, 0, self._entity.n_qs), dtype=gs.tc_float, device=gs.device)
@@ -480,8 +482,10 @@ class PathPlanner(ABC):
         is_plan_with_obj=False,
         obj_geom_start=-1,
         obj_geom_end=-1,
-        ee_link_idx=0,
-        obj_link_idx=0,
+        # ee_link_idx/obj_link_idx/_pos/_quat are only consumed when is_plan_with_obj=True; they
+        # default to None so callers don't need a sentinel int when no object is attached.
+        ee_link_idx=None,
+        obj_link_idx=None,
         _pos=None,
         _quat=None,
     ):
@@ -575,8 +579,10 @@ class PathPlanner(ABC):
         is_plan_with_obj=False,
         obj_geom_start=-1,
         obj_geom_end=-1,
-        ee_link_idx=0,
-        obj_link_idx=0,
+        # ee_link_idx/obj_link_idx are only consumed via `check_collision` when is_plan_with_obj=True;
+        # default to None so callers don't need a sentinel int when no object is attached.
+        ee_link_idx=None,
+        obj_link_idx=None,
         _pos=None,
         _quat=None,
     ):
@@ -817,7 +823,6 @@ class RRT(PathPlanner):
         ee_link_idx=None,
         obj_entity=None,
         envs_idx=None,
-        restore_state=True,
     ):
         if qpos_goal is None:
             gs.raise_exception("`qpos_goal` must be specified.")
@@ -829,37 +834,19 @@ class RRT(PathPlanner):
         if self._solver.n_envs > 0 and len(envs_idx) == 0:
             return self._empty_plan_result(num_waypoints)
         qpos_cur, qpos_goal, qpos_start, envs_idx = self._sanitize_qposs(qpos_goal, qpos_start, envs_idx)
+
         is_plan_with_obj = ee_link_idx is not None and obj_entity is not None
-        obj_state = None
-        hibernation_state = None
-        collider_state = None
-        constraint_state = None
-        errno_state = None
-        planner_error = None
-        restore_runtime_state = restore_state and is_plan_with_obj
-
-        try:
-            _pos, _quat = None, None
+        if is_plan_with_obj:
+            obj_geom_start = obj_entity.geom_start
+            obj_geom_end = obj_entity.geom_end
+            obj_link_idx = obj_entity.base_link_idx
+            _pos, _quat = self.get_link_pose(ee_link_idx, obj_link_idx, envs_idx)
+        else:
             obj_geom_start, obj_geom_end = -1, -1
-            if restore_runtime_state:
-                errno_state = self.snapshot_errno_state()
-            if restore_state and is_plan_with_obj:
-                obj_geom_start = obj_entity.geom_start
-                obj_geom_end = obj_entity.geom_end
-                obj_link_idx = obj_entity._links[0].idx
-                _pos, _quat = self.get_link_pose(ee_link_idx, obj_link_idx, envs_idx)
-                obj_state = self.snapshot_entity_state(obj_entity, envs_idx)
-            elif is_plan_with_obj:
-                obj_geom_start = obj_entity.geom_start
-                obj_geom_end = obj_entity.geom_end
-                obj_link_idx = obj_entity._links[0].idx
-                _pos, _quat = self.get_link_pose(ee_link_idx, obj_link_idx, envs_idx)
+            obj_link_idx = None
+            _pos, _quat = None, None
 
-            if restore_runtime_state:
-                hibernation_state = self.snapshot_hibernation_state()
-                collider_state = self.snapshot_collider_state()
-                constraint_state = self.snapshot_constraint_state()
-
+        with self._planning_transaction(qpos_cur, envs_idx, obj_entity if is_plan_with_obj else None):
             ignore_geom_pairs = self.get_exclude_geom_pairs((qpos_goal, qpos_start), envs_idx)
 
             self._init_rrt_fields(max_nodes=max_nodes, max_step_size=resolution)
@@ -868,7 +855,7 @@ class RRT(PathPlanner):
 
             gs.logger.debug("Start RRT planning...")
             time_start = time.time()
-            for i_n in range(self._rrt_max_nodes):
+            for _ in range(self._rrt_max_nodes):
                 if self._rrt_is_active.to_torch().any():
                     self._kernel_rrt_step1(
                         qpos=self._solver.qpos,
@@ -933,67 +920,39 @@ class RRT(PathPlanner):
             if self._solver.n_envs > 1:
                 sol = align_waypoints_length(sol, mask, mask.sum(dim=0).max())
             if smooth_path:
-                if is_plan_with_obj:
-                    sol = self.shortcut_path(
-                        torch.ones_like(sol[..., 0]),
-                        sol,
-                        iterations=10,
-                        ignore_geom_pairs=ignore_geom_pairs,
-                        envs_idx=envs_idx,
-                        is_plan_with_obj=is_plan_with_obj,
-                        obj_geom_start=obj_geom_start,
-                        obj_geom_end=obj_geom_end,
-                        ee_link_idx=ee_link_idx,
-                        obj_link_idx=obj_link_idx,
-                        _pos=_pos,
-                        _quat=_quat,
-                    )
-                else:
-                    sol = self.shortcut_path(
-                        torch.ones_like(sol[..., 0]),
-                        sol,
-                        iterations=10,
-                        ignore_geom_pairs=ignore_geom_pairs,
-                        envs_idx=envs_idx,
-                    )
+                sol = self.shortcut_path(
+                    torch.ones_like(sol[..., 0]),
+                    sol,
+                    iterations=10,
+                    ignore_geom_pairs=ignore_geom_pairs,
+                    envs_idx=envs_idx,
+                    is_plan_with_obj=is_plan_with_obj,
+                    obj_geom_start=obj_geom_start,
+                    obj_geom_end=obj_geom_end,
+                    ee_link_idx=ee_link_idx,
+                    obj_link_idx=obj_link_idx,
+                    _pos=_pos,
+                    _quat=_quat,
+                )
             sol = align_waypoints_length(sol, torch.ones_like(sol[..., 0], dtype=torch.bool), num_waypoints)
 
             if not ignore_collision:
-                if is_plan_with_obj:
-                    is_invalid |= self.check_collision(
-                        sol,
-                        ignore_geom_pairs,
-                        envs_idx,
-                        is_plan_with_obj=is_plan_with_obj,
-                        obj_geom_start=obj_geom_start,
-                        obj_geom_end=obj_geom_end,
-                        ee_link_idx=ee_link_idx,
-                        obj_link_idx=obj_link_idx,
-                        _pos=_pos,
-                        _quat=_quat,
-                    ).bool()
-                else:
-                    is_invalid |= self.check_collision(sol, ignore_geom_pairs, envs_idx).bool()
+                is_invalid |= self.check_collision(
+                    sol,
+                    ignore_geom_pairs,
+                    envs_idx,
+                    is_plan_with_obj=is_plan_with_obj,
+                    obj_geom_start=obj_geom_start,
+                    obj_geom_end=obj_geom_end,
+                    ee_link_idx=ee_link_idx,
+                    obj_link_idx=obj_link_idx,
+                    _pos=_pos,
+                    _quat=_quat,
+                ).bool()
 
             if is_invalid.any():
                 gs.logger.info(f"RRT planning failed in {int(is_invalid.sum())} environments")
             return sol, is_invalid
-        except BaseException as exc:
-            planner_error = exc
-            raise
-        finally:
-            if restore_state:
-                self.restore_planning_state(
-                    qpos_cur,
-                    envs_idx,
-                    obj_entity,
-                    obj_state,
-                    collider_state,
-                    hibernation_state,
-                    constraint_state,
-                    errno_state,
-                    planner_error=planner_error,
-                )
 
 
 @qd.data_oriented
@@ -1239,7 +1198,6 @@ class RRTConnect(PathPlanner):
         ee_link_idx=None,
         obj_entity=None,
         envs_idx=None,
-        restore_state=True,
     ):
         if qpos_goal is None:
             gs.raise_exception("`qpos_goal` must be specified.")
@@ -1251,37 +1209,19 @@ class RRTConnect(PathPlanner):
         if self._solver.n_envs > 0 and len(envs_idx) == 0:
             return self._empty_plan_result(num_waypoints)
         qpos_cur, qpos_goal, qpos_start, envs_idx = self._sanitize_qposs(qpos_goal, qpos_start, envs_idx)
+
         is_plan_with_obj = ee_link_idx is not None and obj_entity is not None
-        obj_state = None
-        hibernation_state = None
-        collider_state = None
-        constraint_state = None
-        errno_state = None
-        planner_error = None
-        restore_runtime_state = restore_state and is_plan_with_obj
-
-        try:
-            _pos, _quat = None, None
+        if is_plan_with_obj:
+            obj_geom_start = obj_entity.geom_start
+            obj_geom_end = obj_entity.geom_end
+            obj_link_idx = obj_entity.base_link_idx
+            _pos, _quat = self.get_link_pose(ee_link_idx, obj_link_idx, envs_idx)
+        else:
             obj_geom_start, obj_geom_end = -1, -1
-            if restore_runtime_state:
-                errno_state = self.snapshot_errno_state()
-            if restore_state and is_plan_with_obj:
-                obj_geom_start = obj_entity.geom_start
-                obj_geom_end = obj_entity.geom_end
-                obj_link_idx = obj_entity._links[0].idx
-                _pos, _quat = self.get_link_pose(ee_link_idx, obj_link_idx, envs_idx)
-                obj_state = self.snapshot_entity_state(obj_entity, envs_idx)
-            elif is_plan_with_obj:
-                obj_geom_start = obj_entity.geom_start
-                obj_geom_end = obj_entity.geom_end
-                obj_link_idx = obj_entity._links[0].idx
-                _pos, _quat = self.get_link_pose(ee_link_idx, obj_link_idx, envs_idx)
+            obj_link_idx = None
+            _pos, _quat = None, None
 
-            if restore_runtime_state:
-                hibernation_state = self.snapshot_hibernation_state()
-                collider_state = self.snapshot_collider_state()
-                constraint_state = self.snapshot_constraint_state()
-
+        with self._planning_transaction(qpos_cur, envs_idx, obj_entity if is_plan_with_obj else None):
             ignore_geom_pairs = self.get_exclude_geom_pairs([qpos_goal, qpos_start], envs_idx)
 
             self._init_rrt_connect_fields(max_nodes=max_nodes, max_step_size=resolution)
@@ -1369,68 +1309,40 @@ class RRTConnect(PathPlanner):
             if self._solver.n_envs > 1:
                 sol = align_waypoints_length(sol, mask, mask.sum(dim=0).max())
             if smooth_path:
-                if is_plan_with_obj:
-                    sol = self.shortcut_path(
-                        torch.ones_like(sol[..., 0]),
-                        sol,
-                        iterations=10,
-                        ignore_geom_pairs=ignore_geom_pairs,
-                        envs_idx=envs_idx,
-                        is_plan_with_obj=is_plan_with_obj,
-                        obj_geom_start=obj_geom_start,
-                        obj_geom_end=obj_geom_end,
-                        ee_link_idx=ee_link_idx,
-                        obj_link_idx=obj_link_idx,
-                        _pos=_pos,
-                        _quat=_quat,
-                    )
-                else:
-                    sol = self.shortcut_path(
-                        torch.ones_like(sol[..., 0]),
-                        sol,
-                        iterations=10,
-                        ignore_geom_pairs=ignore_geom_pairs,
-                        envs_idx=envs_idx,
-                    )
+                sol = self.shortcut_path(
+                    torch.ones_like(sol[..., 0]),
+                    sol,
+                    iterations=10,
+                    ignore_geom_pairs=ignore_geom_pairs,
+                    envs_idx=envs_idx,
+                    is_plan_with_obj=is_plan_with_obj,
+                    obj_geom_start=obj_geom_start,
+                    obj_geom_end=obj_geom_end,
+                    ee_link_idx=ee_link_idx,
+                    obj_link_idx=obj_link_idx,
+                    _pos=_pos,
+                    _quat=_quat,
+                )
             sol = align_waypoints_length(sol, torch.ones_like(sol[..., 0], dtype=torch.bool), num_waypoints)
 
             if not ignore_collision:
-                if is_plan_with_obj:
-                    is_invalid |= self.check_collision(
-                        sol,
-                        ignore_geom_pairs,
-                        envs_idx,
-                        is_plan_with_obj=is_plan_with_obj,
-                        obj_geom_start=obj_geom_start,
-                        obj_geom_end=obj_geom_end,
-                        ee_link_idx=ee_link_idx,
-                        obj_link_idx=obj_link_idx,
-                        _pos=_pos,
-                        _quat=_quat,
-                    ).bool()
-                else:
-                    is_invalid |= self.check_collision(sol, ignore_geom_pairs, envs_idx).bool()
+                is_invalid |= self.check_collision(
+                    sol,
+                    ignore_geom_pairs,
+                    envs_idx,
+                    is_plan_with_obj=is_plan_with_obj,
+                    obj_geom_start=obj_geom_start,
+                    obj_geom_end=obj_geom_end,
+                    ee_link_idx=ee_link_idx,
+                    obj_link_idx=obj_link_idx,
+                    _pos=_pos,
+                    _quat=_quat,
+                ).bool()
 
             if is_invalid.any():
                 gs.logger.info(f"RRTConnect planning failed in {int(is_invalid.sum())} environments")
 
             return sol, is_invalid
-        except BaseException as exc:
-            planner_error = exc
-            raise
-        finally:
-            if restore_state:
-                self.restore_planning_state(
-                    qpos_cur,
-                    envs_idx,
-                    obj_entity,
-                    obj_state,
-                    collider_state,
-                    hibernation_state,
-                    constraint_state,
-                    errno_state,
-                    planner_error=planner_error,
-                )
 
 
 # ------------------------------------------------------------------------------------

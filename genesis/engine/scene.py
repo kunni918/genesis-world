@@ -1557,10 +1557,16 @@ class Scene(RBC):
             return sanitize_bool_mask(envs_idx)
         if isinstance(envs_idx, np.ndarray) and envs_idx.dtype == np.bool_:
             return sanitize_bool_mask(envs_idx)
-        if isinstance(envs_idx, (tuple, list)) and envs_idx and all(
-            isinstance(idx, (bool, np.bool_)) for idx in envs_idx
-        ):
-            return sanitize_bool_mask(envs_idx)
+        if isinstance(envs_idx, (tuple, list)) and envs_idx:
+            has_bool = any(isinstance(idx, (bool, np.bool_)) for idx in envs_idx)
+            all_bool = all(isinstance(idx, (bool, np.bool_)) for idx in envs_idx)
+            if all_bool:
+                return sanitize_bool_mask(envs_idx)
+            if has_bool:
+                gs.raise_exception(
+                    "Mixing bool and int values in `envs_idx` list/tuple is ambiguous; pass either "
+                    "an all-bool mask (length == n_envs) or an all-int index list."
+                )
 
         if isinstance(envs_idx, (slice, range)):
             return self._envs_idx[envs_idx]

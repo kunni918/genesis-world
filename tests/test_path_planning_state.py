@@ -65,23 +65,45 @@ def _base_collider_snapshot_ids(planner, collider_state):
     return expected_ids
 
 
+def _force_rrt_goal_sampling(monkeypatch):
+    """Pin RRT's goal-bias to 1.0 so tests that assert path validity under tiny `max_nodes` are
+    deterministic. The default 0.05 goal-bias is goal-bias-flaky for short-budget plans."""
+    from genesis.utils.path_planning import RRT
+
+    original_init_rrt_fields = RRT._init_rrt_fields
+
+    def patched(self, goal_bias=0.05, max_nodes=2000, pos_tol=5e-3, max_step_size=0.1):
+        original_init_rrt_fields(
+            self, goal_bias=1.0, max_nodes=max_nodes, pos_tol=pos_tol, max_step_size=max_step_size
+        )
+
+    monkeypatch.setattr(RRT, "_init_rrt_fields", patched)
+
+
+def _make_planner_scene(*, requires_grad: bool = False, **rigid_overrides):
+    """Common scene factory for planner state tests: disables collision/constraint pipelines and
+    hibernation/contact-island so the test scene is fully deterministic and cheap to build."""
+    rigid_options = dict(
+        enable_collision=False,
+        enable_self_collision=False,
+        enable_joint_limit=False,
+        disable_constraint=True,
+        use_contact_island=False,
+        use_hibernation=False,
+    )
+    rigid_options.update(rigid_overrides)
+    kwargs = dict(rigid_options=gs.options.RigidOptions(**rigid_options), show_viewer=False)
+    if requires_grad:
+        kwargs["sim_options"] = gs.options.SimOptions(requires_grad=True)
+    return gs.Scene(**kwargs)
+
+
 @pytest.mark.cache(False)
 @pytest.mark.parametrize("backend", [gs.cpu])
 def test_internal_object_restore_does_not_update_tracked_targets(backend):
     from genesis.utils.path_planning import RRT
 
-    scene = gs.Scene(
-        sim_options=gs.options.SimOptions(requires_grad=True),
-        rigid_options=gs.options.RigidOptions(
-            enable_collision=False,
-            enable_self_collision=False,
-            enable_joint_limit=False,
-            disable_constraint=True,
-            use_contact_island=False,
-            use_hibernation=False,
-        ),
-        show_viewer=False,
-    )
+    scene = _make_planner_scene(requires_grad=True)
     anchor, cube = _add_restore_test_entities(scene)
 
     planner = RRT(anchor)
@@ -124,32 +146,9 @@ def test_internal_object_restore_respects_partial_envs_idx(backend, tol):
 @pytest.mark.parametrize("backend", [gs.cpu])
 def test_plan_path_with_entity_restores_state_from_explicit_start_qpos(backend, planner, tol, monkeypatch):
     if planner == "RRT":
-        from genesis.utils.path_planning import RRT
+        _force_rrt_goal_sampling(monkeypatch)
 
-        original_init_rrt_fields = RRT._init_rrt_fields
-
-        def init_rrt_fields_with_goal_sample(self, goal_bias=0.05, max_nodes=2000, pos_tol=5e-3, max_step_size=0.1):
-            original_init_rrt_fields(
-                self,
-                goal_bias=1.0,
-                max_nodes=max_nodes,
-                pos_tol=pos_tol,
-                max_step_size=max_step_size,
-            )
-
-        monkeypatch.setattr(RRT, "_init_rrt_fields", init_rrt_fields_with_goal_sample)
-
-    scene = gs.Scene(
-        rigid_options=gs.options.RigidOptions(
-            enable_collision=False,
-            enable_self_collision=False,
-            enable_joint_limit=False,
-            disable_constraint=True,
-            use_contact_island=False,
-            use_hibernation=False,
-        ),
-        show_viewer=False,
-    )
+    scene = _make_planner_scene()
     cube = scene.add_entity(
         gs.morphs.Box(
             size=(0.05, 0.05, 0.05),
@@ -229,84 +228,16 @@ def test_plan_path_with_entity_restores_existing_collider_state(backend):
     _assert_qd_state_matches(collider_snapshot)
 
 
-@pytest.mark.parametrize("backend", [gs.cpu])
-def test_plan_path_with_entity_restores_constraint_state(backend, monkeypatch):
-    from genesis.utils.path_planning import RRTConnect
-
-    scene = gs.Scene(
-        rigid_options=gs.options.RigidOptions(
-            enable_collision=False,
-            enable_self_collision=False,
-            enable_joint_limit=False,
-            use_contact_island=False,
-            use_hibernation=False,
-        ),
-        show_viewer=False,
-    )
-    cube = scene.add_entity(
-        gs.morphs.Box(
-            size=(0.05, 0.05, 0.05),
-            pos=(0.30, 0.10, 0.35),
-        )
-    )
-    franka = scene.add_entity(gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml"))
-    scene.build()
-
-    planner = RRTConnect(franka)
-    constraint_state = scene.rigid_solver.constraint_solver.constraint_state
-    qd_to_torch(constraint_state.is_warmstart, copy=False).fill_(True)
-    qd_to_torch(constraint_state.qacc_ws, copy=False).fill_(3.25)
-    constraint_snapshot = planner.snapshot_tensor_state(planner.iter_state_tensors(constraint_state))
-    cache_key = ("sentinel", False)
-    cache_value = object()
-    scene.rigid_solver.constraint_solver._eq_const_info_cache[cache_key] = cache_value
-
-    def fake_plan(self, *args, **kwargs):
-        qd_to_torch(constraint_state.is_warmstart, copy=False).fill_(False)
-        qd_to_torch(constraint_state.qacc_ws, copy=False).fill_(9.5)
-        scene.rigid_solver.constraint_solver._eq_const_info_cache.clear()
-        path = torch.zeros((kwargs["num_waypoints"], 1, self._entity.n_qs), dtype=gs.tc_float, device=gs.device)
-        is_invalid = torch.tensor([False], dtype=torch.bool, device=gs.device)
-        return path, is_invalid
-
-    monkeypatch.setattr(RRTConnect, "plan", fake_plan)
-
-    path, valid = franka.plan_path(
-        qpos_goal=START_QPOS,
-        qpos_start=START_QPOS,
-        max_nodes=8,
-        num_waypoints=8,
-        max_retry=0,
-        smooth_path=False,
-        ignore_collision=True,
-        planner="RRTConnect",
-        ee_link_name="hand",
-        with_entity=cube,
-        return_valid_mask=True,
-    )
-
-    _assert_plan_valid(valid)
-    assert path.shape == (8, franka.n_qs)
-    _assert_qd_state_matches(constraint_snapshot)
-    assert scene.rigid_solver.constraint_solver._eq_const_info_cache[cache_key] is cache_value
-
-
 @pytest.mark.required
 @pytest.mark.cache(False)
 @pytest.mark.parametrize("backend", [gs.cpu])
-def test_plan_path_with_entity_retries_from_entry_state(backend, monkeypatch, tol):
+def test_plan_path_with_entity_retries_when_planner_reports_invalid(backend, monkeypatch):
+    """Wrapper-level: when the inner planner reports `is_invalid=True`, `plan_path` retries up to
+    `max_retry+1` times and merges results. State restoration is the inner planner's contract and is
+    covered by the direct-planner tests; the wrapper is a trivial delegator after the refactor."""
     from genesis.utils.path_planning import RRTConnect
 
-    scene = gs.Scene(
-        rigid_options=gs.options.RigidOptions(
-            enable_collision=False,
-            enable_self_collision=False,
-            enable_joint_limit=False,
-            use_contact_island=False,
-            use_hibernation=False,
-        ),
-        show_viewer=False,
-    )
+    scene = gs.Scene(show_viewer=False)
     cube = scene.add_entity(
         gs.morphs.Box(
             size=(0.05, 0.05, 0.05),
@@ -316,48 +247,12 @@ def test_plan_path_with_entity_retries_from_entry_state(backend, monkeypatch, to
     franka = scene.add_entity(gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml"))
     scene.build()
 
-    planner = RRTConnect(franka)
-    robot_qpos_before = franka.get_qpos().clone()
-    cube_pos_before = cube.get_pos().clone()
-    errno = qd_to_torch(scene.rigid_solver._errno, copy=False)
-    errno.fill_(3)
-
-    constraint_state = scene.rigid_solver.constraint_solver.constraint_state
-    qd_to_torch(constraint_state.is_warmstart, copy=False).fill_(True)
-    qd_to_torch(constraint_state.qacc_ws, copy=False).fill_(3.25)
-    constraint_snapshot = planner.snapshot_tensor_state(planner.iter_state_tensors(constraint_state))
-    cache_key = ("retry", False)
-    cache_value = object()
-    scene.rigid_solver.constraint_solver._eq_const_info_cache[cache_key] = cache_value
-
-    collider_state = scene.rigid_solver.collider._collider_state
-    qd_to_torch(collider_state.n_contacts, copy=False).fill_(2)
-    collider_snapshot = planner.snapshot_tensor_state([collider_state.n_contacts])
-    scene.rigid_solver.collider._contact_data_cache["retry"] = object()
-    call_qpos = []
+    calls = []
 
     def fake_plan(self, *args, **kwargs):
-        assert kwargs["restore_state"] is False
-        call_qpos.append(self._entity.get_qpos().clone())
-        if len(call_qpos) == 2:
-            assert torch.equal(errno, torch.full_like(errno, 3))
-            _assert_qd_state_matches(constraint_snapshot)
-            assert scene.rigid_solver.constraint_solver._eq_const_info_cache[cache_key] is cache_value
-            _assert_qd_state_matches(collider_snapshot)
-            assert scene.rigid_solver.collider._contact_data_cache == {}
-        mutation = torch.full_like(robot_qpos_before, 0.01 * len(call_qpos))
-        self._entity.set_qpos(robot_qpos_before + mutation, zero_velocity=False)
-        kwargs["obj_entity"].set_pos(
-            cube_pos_before + torch.tensor([0.01 * len(call_qpos), 0.0, 0.0], device=gs.device)
-        )
-        errno.fill_(7)
-        qd_to_torch(constraint_state.is_warmstart, copy=False).fill_(False)
-        qd_to_torch(constraint_state.qacc_ws, copy=False).fill_(9.5)
-        scene.rigid_solver.constraint_solver._eq_const_info_cache.clear()
-        qd_to_torch(collider_state.n_contacts, copy=False).fill_(11)
-        scene.rigid_solver.collider._contact_data_cache["dirty"] = object()
+        calls.append(kwargs.get("envs_idx"))
+        is_invalid = torch.tensor([len(calls) == 1], dtype=torch.bool, device=gs.device)
         path = torch.zeros((kwargs["num_waypoints"], 1, self._entity.n_qs), dtype=gs.tc_float, device=gs.device)
-        is_invalid = torch.tensor([len(call_qpos) == 1], dtype=torch.bool, device=gs.device)
         return path, is_invalid
 
     monkeypatch.setattr(RRTConnect, "plan", fake_plan)
@@ -377,274 +272,21 @@ def test_plan_path_with_entity_retries_from_entry_state(backend, monkeypatch, to
 
     _assert_plan_valid(valid)
     assert path.shape == (8, franka.n_qs)
-    assert len(call_qpos) == 2
-    assert_allclose(call_qpos[1], robot_qpos_before, tol=tol)
-    assert_allclose(franka.get_qpos(), robot_qpos_before, tol=tol)
-    assert_allclose(cube.get_pos(), cube_pos_before, tol=tol)
-    assert torch.equal(errno, torch.full_like(errno, 3))
-    _assert_qd_state_matches(constraint_snapshot)
-    assert scene.rigid_solver.constraint_solver._eq_const_info_cache[cache_key] is cache_value
-    _assert_qd_state_matches(collider_snapshot)
-    assert scene.rigid_solver.collider._contact_data_cache == {}
-
-
-@pytest.mark.cache(False)
-@pytest.mark.parametrize("backend", [gs.cpu])
-def test_plan_path_with_entity_restores_errno_after_query(backend, monkeypatch):
-    from genesis.utils.path_planning import RRTConnect
-
-    scene = gs.Scene(
-        rigid_options=gs.options.RigidOptions(
-            enable_collision=False,
-            enable_self_collision=False,
-            enable_joint_limit=False,
-            disable_constraint=True,
-            use_contact_island=False,
-            use_hibernation=False,
-        ),
-        show_viewer=False,
-    )
-    cube = scene.add_entity(
-        gs.morphs.Box(
-            size=(0.05, 0.05, 0.05),
-            pos=(0.30, 0.10, 0.35),
-        )
-    )
-    franka = scene.add_entity(gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml"))
-    scene.build()
-
-    errno = qd_to_torch(scene.rigid_solver._errno, copy=False)
-    errno.fill_(3)
-
-    def fake_plan(self, *args, **kwargs):
-        errno.fill_(7)
-        path = torch.zeros((kwargs["num_waypoints"], 1, self._entity.n_qs), dtype=gs.tc_float, device=gs.device)
-        is_invalid = torch.tensor([False], dtype=torch.bool, device=gs.device)
-        return path, is_invalid
-
-    monkeypatch.setattr(RRTConnect, "plan", fake_plan)
-
-    _, valid = franka.plan_path(
-        qpos_goal=START_QPOS,
-        max_nodes=8,
-        num_waypoints=8,
-        max_retry=0,
-        smooth_path=False,
-        ignore_collision=True,
-        planner="RRTConnect",
-        ee_link_name="hand",
-        with_entity=cube,
-        return_valid_mask=True,
-    )
-
-    _assert_plan_valid(valid)
-    assert torch.equal(errno, torch.full_like(errno, 3))
-
-
-@pytest.mark.required
-@pytest.mark.cache(False)
-@pytest.mark.parametrize("backend", [gs.cpu])
-def test_plan_path_with_entity_restores_selected_env_only(backend, monkeypatch, tol):
-    from genesis.utils.path_planning import RRTConnect
-
-    scene = gs.Scene(
-        rigid_options=gs.options.RigidOptions(
-            enable_collision=False,
-            enable_self_collision=False,
-            enable_joint_limit=False,
-            disable_constraint=True,
-            use_contact_island=False,
-            use_hibernation=False,
-        ),
-        show_viewer=False,
-    )
-    cube = scene.add_entity(
-        gs.morphs.Box(
-            size=(0.05, 0.05, 0.05),
-            pos=(0.30, 0.10, 0.35),
-        )
-    )
-    franka = scene.add_entity(gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml"))
-    scene.build(n_envs=2)
-
-    envs_idx = torch.tensor([1], dtype=gs.tc_int, device=gs.device)
-    other_env_idx = torch.tensor([0], dtype=gs.tc_int, device=gs.device)
-    robot_qpos_before = franka.get_qpos().clone()
-    cube_pos_before = cube.get_pos().clone()
-    robot_qpos_unselected = robot_qpos_before[other_env_idx] + 0.03
-    cube_pos_unselected = cube_pos_before[other_env_idx] + torch.tensor([[0.03, 0.0, 0.0]], device=gs.device)
-    errno = qd_to_torch(scene.rigid_solver._errno, copy=False)
-    errno.copy_(torch.tensor([3, 4], dtype=errno.dtype, device=errno.device))
-    constraint_state = scene.rigid_solver.constraint_solver.constraint_state
-    is_warmstart = qd_to_torch(constraint_state.is_warmstart, copy=False)
-    is_warmstart.copy_(torch.tensor([True, False], dtype=torch.bool, device=is_warmstart.device))
-    qacc_ws = qd_to_torch(constraint_state.qacc_ws, copy=False)
-    qacc_ws[:, other_env_idx] = 1.25
-    qacc_ws[:, envs_idx] = 3.25
-    collider_state = scene.rigid_solver.collider._collider_state
-    n_contacts = qd_to_torch(collider_state.n_contacts, copy=False)
-    n_contacts.copy_(torch.tensor([2, 3], dtype=n_contacts.dtype, device=n_contacts.device))
-
-    def fake_plan(self, *args, **kwargs):
-        assert torch.equal(kwargs["envs_idx"], envs_idx)
-        self._entity.set_qpos(robot_qpos_before[envs_idx] + 0.01, envs_idx=envs_idx, zero_velocity=False)
-        self._entity.set_qpos(robot_qpos_unselected, envs_idx=other_env_idx, zero_velocity=False)
-        kwargs["obj_entity"].set_pos(
-            cube_pos_before[envs_idx] + torch.tensor([[0.02, 0.0, 0.0]], device=gs.device),
-            envs_idx=envs_idx,
-        )
-        kwargs["obj_entity"].set_pos(cube_pos_unselected, envs_idx=other_env_idx)
-        errno[envs_idx] = 7
-        errno[other_env_idx] = 8
-        is_warmstart[envs_idx] = True
-        is_warmstart[other_env_idx] = False
-        qacc_ws[:, envs_idx] = 9.5
-        qacc_ws[:, other_env_idx] = 8.5
-        n_contacts[envs_idx] = 11
-        n_contacts[other_env_idx] = 12
-        path = torch.zeros((kwargs["num_waypoints"], 1, self._entity.n_qs), dtype=gs.tc_float, device=gs.device)
-        is_invalid = torch.tensor([False], dtype=torch.bool, device=gs.device)
-        return path, is_invalid
-
-    monkeypatch.setattr(RRTConnect, "plan", fake_plan)
-
-    path, valid = franka.plan_path(
-        qpos_goal=START_QPOS,
-        max_nodes=8,
-        num_waypoints=8,
-        max_retry=0,
-        smooth_path=False,
-        ignore_collision=True,
-        envs_idx=envs_idx,
-        planner="RRTConnect",
-        ee_link_name="hand",
-        with_entity=cube,
-        return_valid_mask=True,
-    )
-
-    _assert_plan_valid(valid)
-    assert path.shape == (8, 1, franka.n_qs)
-    assert_allclose(franka.get_qpos(envs_idx=envs_idx), robot_qpos_before[envs_idx], tol=tol)
-    assert_allclose(cube.get_pos(envs_idx=envs_idx), cube_pos_before[envs_idx], tol=tol)
-    assert_allclose(franka.get_qpos(envs_idx=other_env_idx), robot_qpos_unselected, tol=tol)
-    assert_allclose(cube.get_pos(envs_idx=other_env_idx), cube_pos_unselected, tol=tol)
-    assert torch.equal(errno, torch.tensor([3, 4], dtype=errno.dtype, device=errno.device))
-    assert torch.equal(is_warmstart, torch.tensor([True, False], dtype=torch.bool, device=is_warmstart.device))
-    assert torch.allclose(qacc_ws[:, other_env_idx].squeeze(1), torch.full_like(qacc_ws[:, 0], 1.25))
-    assert torch.allclose(qacc_ws[:, envs_idx].squeeze(1), torch.full_like(qacc_ws[:, 1], 3.25))
-    assert torch.equal(n_contacts, torch.tensor([2, 3], dtype=n_contacts.dtype, device=n_contacts.device))
-
-
-@pytest.mark.cache(False)
-@pytest.mark.parametrize("backend", [gs.cpu])
-def test_plan_path_restores_full_runtime_for_selected_env_query_with_grad(backend, monkeypatch):
-    from genesis.utils.path_planning import RRTConnect
-
-    scene = gs.Scene(
-        sim_options=gs.options.SimOptions(requires_grad=True),
-        rigid_options=gs.options.RigidOptions(
-            enable_collision=False,
-            enable_self_collision=False,
-            enable_joint_limit=False,
-            disable_constraint=True,
-            use_contact_island=False,
-            use_hibernation=False,
-        ),
-        show_viewer=False,
-    )
-    cube = scene.add_entity(gs.morphs.Box(size=(0.05, 0.05, 0.05), pos=(0.30, 0.10, 0.35)))
-    franka = scene.add_entity(gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml"))
-    scene.build(n_envs=2)
-
-    envs_idx = torch.tensor([1], dtype=gs.tc_int, device=gs.device)
-    other_env_idx = torch.tensor([0], dtype=gs.tc_int, device=gs.device)
-    collider_state = scene.rigid_solver.collider._collider_state
-    contact_normal = qd_to_torch(collider_state.contact_data.normal, copy=False)
-    cache_normal = qd_to_torch(collider_state.contact_cache.normal, copy=False)
-    diff_input = collider_state.diff_contact_input
-    diff_ref_id = qd_to_torch(diff_input.ref_id, copy=False)
-    diff_valid = qd_to_torch(diff_input.valid, copy=False)
-    diff_ref_penetration = qd_to_torch(diff_input.ref_penetration, copy=False)
-
-    contact_normal[:, other_env_idx] = 1.25
-    contact_normal[:, envs_idx] = 3.25
-    cache_normal[:, other_env_idx] = 1.25
-    cache_normal[:, envs_idx] = 3.25
-    diff_ref_id[other_env_idx] = 1
-    diff_ref_id[envs_idx] = 2
-    diff_valid[other_env_idx] = False
-    diff_valid[envs_idx] = True
-    diff_ref_penetration[other_env_idx] = 1.25
-    diff_ref_penetration[envs_idx] = 3.25
-
-    expected = [
-        (contact_normal, contact_normal.clone()),
-        (cache_normal, cache_normal.clone()),
-        (diff_ref_id, diff_ref_id.clone()),
-        (diff_valid, diff_valid.clone()),
-        (diff_ref_penetration, diff_ref_penetration.clone()),
-    ]
-
-    def fake_plan(self, *args, **kwargs):
-        assert torch.equal(kwargs["envs_idx"], envs_idx)
-        contact_normal[:, other_env_idx] = 8.5
-        contact_normal[:, envs_idx] = 9.5
-        cache_normal[:, other_env_idx] = 8.5
-        cache_normal[:, envs_idx] = 9.5
-        diff_ref_id[other_env_idx] = 8
-        diff_ref_id[envs_idx] = 9
-        diff_valid[other_env_idx] = True
-        diff_valid[envs_idx] = False
-        diff_ref_penetration[other_env_idx] = 8.5
-        diff_ref_penetration[envs_idx] = 9.5
-        path = torch.zeros((kwargs["num_waypoints"], 1, self._entity.n_qs), dtype=gs.tc_float, device=gs.device)
-        is_invalid = torch.tensor([False], dtype=torch.bool, device=gs.device)
-        return path, is_invalid
-
-    monkeypatch.setattr(RRTConnect, "plan", fake_plan)
-
-    _, valid = franka.plan_path(
-        qpos_goal=START_QPOS,
-        max_nodes=8,
-        num_waypoints=8,
-        max_retry=0,
-        smooth_path=False,
-        ignore_collision=True,
-        envs_idx=envs_idx,
-        planner="RRTConnect",
-        ee_link_name="hand",
-        with_entity=cube,
-        return_valid_mask=True,
-    )
-
-    _assert_plan_valid(valid)
-    for tensor, expected_value in expected:
-        assert torch.equal(tensor, expected_value)
+    assert len(calls) == 2
 
 
 @pytest.mark.required
 @pytest.mark.cache(False)
 @pytest.mark.parametrize("backend", [gs.cpu])
 @pytest.mark.parametrize("envs_idx_kind", ["tensor_bool", "list_bool", "numpy_bool"])
-def test_plan_path_with_entity_bool_mask_envs_use_selected_count(backend, envs_idx_kind, monkeypatch, tol):
+def test_plan_path_normalizes_bool_mask_envs_to_int_indices(backend, envs_idx_kind, monkeypatch):
+    """Wrapper-level: bool mask `envs_idx` is normalized to int indices before reaching the
+    planner. Restoration semantics for partial envs_idx are covered by the direct-planner tests."""
     from genesis.utils.path_planning import RRTConnect
 
-    scene = gs.Scene(
-        rigid_options=gs.options.RigidOptions(
-            enable_collision=False,
-            enable_self_collision=False,
-            enable_joint_limit=False,
-            disable_constraint=True,
-            use_contact_island=False,
-            use_hibernation=False,
-        ),
-        show_viewer=False,
-    )
+    scene = gs.Scene(show_viewer=False)
     cube = scene.add_entity(
-        gs.morphs.Box(
-            size=(0.05, 0.05, 0.05),
-            pos=(0.30, 0.10, 0.35),
-        )
+        gs.morphs.Box(size=(0.05, 0.05, 0.05), pos=(0.30, 0.10, 0.35))
     )
     franka = scene.add_entity(gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml"))
     scene.build(n_envs=2)
@@ -655,30 +297,12 @@ def test_plan_path_with_entity_bool_mask_envs_use_selected_count(backend, envs_i
         "numpy_bool": np.array([False, True], dtype=np.bool_),
     }[envs_idx_kind]
     expected_envs_idx = torch.tensor([1], dtype=gs.tc_int, device=gs.device)
-    other_env_idx = torch.tensor([0], dtype=gs.tc_int, device=gs.device)
-    robot_qpos_before = franka.get_qpos().clone()
-    cube_pos_before = cube.get_pos().clone()
-    robot_qpos_unselected = robot_qpos_before[other_env_idx] + 0.03
-    cube_pos_unselected = cube_pos_before[other_env_idx] + torch.tensor([[0.03, 0.0, 0.0]], device=gs.device)
-    call_qpos = []
+    seen_envs_idx = []
 
     def fake_plan(self, *args, **kwargs):
-        assert torch.equal(kwargs["envs_idx"], expected_envs_idx)
-        if call_qpos:
-            assert_allclose(self._entity.get_qpos(envs_idx=other_env_idx), robot_qpos_unselected, tol=tol)
-            assert_allclose(kwargs["obj_entity"].get_pos(envs_idx=other_env_idx), cube_pos_unselected, tol=tol)
-        call_qpos.append(self._entity.get_qpos(envs_idx=expected_envs_idx).clone())
-        self._entity.set_qpos(
-            robot_qpos_before[expected_envs_idx] + 0.01,
-            envs_idx=expected_envs_idx,
-            zero_velocity=False,
-        )
-        self._entity.set_qpos(robot_qpos_unselected, envs_idx=other_env_idx, zero_velocity=False)
-        kwargs["obj_entity"].set_pos(cube_pos_before[expected_envs_idx] + 0.01, envs_idx=expected_envs_idx)
-        kwargs["obj_entity"].set_pos(cube_pos_unselected, envs_idx=other_env_idx)
+        seen_envs_idx.append(kwargs["envs_idx"])
         path = torch.zeros((kwargs["num_waypoints"], 1, self._entity.n_qs), dtype=gs.tc_float, device=gs.device)
-        is_invalid = torch.tensor([len(call_qpos) == 1], dtype=torch.bool, device=gs.device)
-        return path, is_invalid
+        return path, torch.tensor([False], dtype=torch.bool, device=gs.device)
 
     monkeypatch.setattr(RRTConnect, "plan", fake_plan)
 
@@ -686,7 +310,7 @@ def test_plan_path_with_entity_bool_mask_envs_use_selected_count(backend, envs_i
         qpos_goal=START_QPOS,
         max_nodes=8,
         num_waypoints=8,
-        max_retry=1,
+        max_retry=0,
         smooth_path=False,
         ignore_collision=True,
         envs_idx=envs_mask,
@@ -696,45 +320,9 @@ def test_plan_path_with_entity_bool_mask_envs_use_selected_count(backend, envs_i
         return_valid_mask=True,
     )
 
-    assert isinstance(valid, torch.Tensor)
-    assert valid.shape == (1,)
     _assert_plan_valid(valid)
     assert path.shape == (8, 1, franka.n_qs)
-    assert len(call_qpos) == 2
-    assert_allclose(call_qpos[1], robot_qpos_before[expected_envs_idx], tol=tol)
-    assert_allclose(franka.get_qpos(envs_idx=expected_envs_idx), robot_qpos_before[expected_envs_idx], tol=tol)
-    assert_allclose(cube.get_pos(envs_idx=expected_envs_idx), cube_pos_before[expected_envs_idx], tol=tol)
-    assert_allclose(franka.get_qpos(envs_idx=other_env_idx), robot_qpos_unselected, tol=tol)
-    assert_allclose(cube.get_pos(envs_idx=other_env_idx), cube_pos_unselected, tol=tol)
-
-
-@pytest.mark.cache(False)
-@pytest.mark.parametrize("backend", [gs.cpu])
-def test_snapshot_constraint_state_excludes_unrestorable_and_unrelated_state(backend):
-    from genesis.utils.path_planning import RRTConnect
-
-    scene = gs.Scene(
-        rigid_options=gs.options.RigidOptions(
-            enable_collision=False,
-            enable_self_collision=False,
-            enable_joint_limit=False,
-            use_contact_island=False,
-            use_hibernation=False,
-        ),
-        show_viewer=False,
-    )
-    anchor, _ = _add_restore_test_entities(scene)
-
-    planner = RRTConnect(anchor)
-    constraint_solver = scene.rigid_solver.constraint_solver
-    tensor_state, _ = planner.snapshot_constraint_state()
-    snapshot_ids = {id(tensor) for tensor, _ in tensor_state}
-
-    assert snapshot_ids == {
-        id(constraint_solver.constraint_state.is_warmstart),
-        id(constraint_solver.constraint_state.qacc_ws),
-    }
-    assert all(hasattr(tensor, "from_torch") for tensor, _ in tensor_state)
+    assert torch.equal(seen_envs_idx[0], expected_envs_idx)
 
 
 @pytest.mark.cache(False)
@@ -797,38 +385,6 @@ def test_snapshot_constraint_state_restores_contact_island_runtime_values(backen
     _assert_qd_state_matches(constraint_snapshot[0])
 
 
-@pytest.mark.cache(False)
-@pytest.mark.parametrize("backend", [gs.cpu])
-def test_snapshot_constraint_state_uses_reset_write_set_not_solver_vars(backend):
-    from genesis.utils.path_planning import RRTConnect
-
-    scene = gs.Scene(
-        rigid_options=gs.options.RigidOptions(
-            enable_collision=False,
-            enable_self_collision=False,
-            enable_joint_limit=False,
-            use_contact_island=False,
-            use_hibernation=False,
-        ),
-        show_viewer=False,
-    )
-    franka = scene.add_entity(gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml"))
-    scene.build()
-
-    planner = RRTConnect(franka)
-    constraint_solver = scene.rigid_solver.constraint_solver
-    constraint_solver.unrelated_solver_state = scene.rigid_solver.entities_info
-    tensor_state, _ = planner.snapshot_constraint_state()
-    snapshot_ids = {id(tensor) for tensor, _ in tensor_state}
-
-    assert snapshot_ids == {
-        id(constraint_solver.constraint_state.is_warmstart),
-        id(constraint_solver.constraint_state.qacc_ws),
-    }
-    assert id(constraint_solver.unrelated_solver_state.link_start) not in snapshot_ids
-    assert all(hasattr(tensor, "from_torch") for tensor, _ in tensor_state)
-
-
 @pytest.mark.required
 @pytest.mark.cache(False)
 @pytest.mark.parametrize("planner", ["RRT", "RRTConnect"])
@@ -836,34 +392,13 @@ def test_snapshot_constraint_state_uses_reset_write_set_not_solver_vars(backend)
 def test_plan_path_without_entity_uses_qpos_restore_without_runtime_snapshots(backend, planner, monkeypatch, tol):
     from genesis.utils.path_planning import RRT, RRTConnect
 
-    scene = gs.Scene(
-        rigid_options=gs.options.RigidOptions(
-            enable_collision=False,
-            enable_self_collision=False,
-            enable_joint_limit=False,
-            disable_constraint=True,
-            use_contact_island=False,
-            use_hibernation=False,
-        ),
-        show_viewer=False,
-    )
+    scene = _make_planner_scene()
     franka = scene.add_entity(gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml"))
     scene.build()
 
     planner_cls = {"RRT": RRT, "RRTConnect": RRTConnect}[planner]
     if planner == "RRT":
-        original_init_rrt_fields = RRT._init_rrt_fields
-
-        def init_rrt_fields_with_goal_sample(self, goal_bias=0.05, max_nodes=2000, pos_tol=5e-3, max_step_size=0.1):
-            original_init_rrt_fields(
-                self,
-                goal_bias=1.0,
-                max_nodes=max_nodes,
-                pos_tol=pos_tol,
-                max_step_size=max_step_size,
-            )
-
-        monkeypatch.setattr(RRT, "_init_rrt_fields", init_rrt_fields_with_goal_sample)
+        _force_rrt_goal_sampling(monkeypatch)
 
     qpos_before = franka.get_qpos().clone()
 
@@ -878,7 +413,6 @@ def test_plan_path_without_entity_uses_qpos_restore_without_runtime_snapshots(ba
         "snapshot_hibernation_state",
         "snapshot_collider_state",
         "snapshot_constraint_state",
-        "snapshot_errno_state",
     ):
         monkeypatch.setattr(planner_cls, helper_name, fail_runtime_snapshot)
     monkeypatch.setattr(planner_cls, "get_exclude_geom_pairs", dirty_get_exclude_geom_pairs)
@@ -906,34 +440,13 @@ def test_plan_path_without_entity_uses_qpos_restore_without_runtime_snapshots(ba
 def test_direct_planner_without_entity_uses_qpos_restore_without_runtime_snapshots(backend, planner, monkeypatch, tol):
     from genesis.utils.path_planning import RRT, RRTConnect
 
-    scene = gs.Scene(
-        rigid_options=gs.options.RigidOptions(
-            enable_collision=False,
-            enable_self_collision=False,
-            enable_joint_limit=False,
-            disable_constraint=True,
-            use_contact_island=False,
-            use_hibernation=False,
-        ),
-        show_viewer=False,
-    )
+    scene = _make_planner_scene()
     franka = scene.add_entity(gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml"))
     scene.build()
 
     planner_cls = {"RRT": RRT, "RRTConnect": RRTConnect}[planner]
     if planner == "RRT":
-        original_init_rrt_fields = RRT._init_rrt_fields
-
-        def init_rrt_fields_with_goal_sample(self, goal_bias=0.05, max_nodes=2000, pos_tol=5e-3, max_step_size=0.1):
-            original_init_rrt_fields(
-                self,
-                goal_bias=1.0,
-                max_nodes=max_nodes,
-                pos_tol=pos_tol,
-                max_step_size=max_step_size,
-            )
-
-        monkeypatch.setattr(RRT, "_init_rrt_fields", init_rrt_fields_with_goal_sample)
+        _force_rrt_goal_sampling(monkeypatch)
 
     planner_obj = planner_cls(franka)
     qpos_before = franka.get_qpos().clone()
@@ -949,7 +462,6 @@ def test_direct_planner_without_entity_uses_qpos_restore_without_runtime_snapsho
         "snapshot_hibernation_state",
         "snapshot_collider_state",
         "snapshot_constraint_state",
-        "snapshot_errno_state",
     ):
         monkeypatch.setattr(planner_cls, helper_name, fail_runtime_snapshot)
     monkeypatch.setattr(planner_cls, "get_exclude_geom_pairs", dirty_get_exclude_geom_pairs)
@@ -961,7 +473,6 @@ def test_direct_planner_without_entity_uses_qpos_restore_without_runtime_snapsho
         num_waypoints=8,
         smooth_path=False,
         ignore_collision=True,
-        restore_state=True,
     )
 
     _assert_plan_valid(~is_invalid)
@@ -977,36 +488,14 @@ def test_direct_planner_with_entity_restores_full_runtime_for_selected_env_query
 ):
     from genesis.utils.path_planning import RRT, RRTConnect
 
-    scene = gs.Scene(
-        sim_options=gs.options.SimOptions(requires_grad=True),
-        rigid_options=gs.options.RigidOptions(
-            enable_collision=False,
-            enable_self_collision=False,
-            enable_joint_limit=False,
-            disable_constraint=True,
-            use_contact_island=False,
-            use_hibernation=False,
-        ),
-        show_viewer=False,
-    )
+    scene = _make_planner_scene(requires_grad=True)
     cube = scene.add_entity(gs.morphs.Box(size=(0.05, 0.05, 0.05), pos=(0.30, 0.10, 0.35)))
     franka = scene.add_entity(gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml"))
     scene.build(n_envs=2)
 
     planner_cls = {"RRT": RRT, "RRTConnect": RRTConnect}[planner]
     if planner == "RRT":
-        original_init_rrt_fields = RRT._init_rrt_fields
-
-        def init_rrt_fields_with_goal_sample(self, goal_bias=0.05, max_nodes=2000, pos_tol=5e-3, max_step_size=0.1):
-            original_init_rrt_fields(
-                self,
-                goal_bias=1.0,
-                max_nodes=max_nodes,
-                pos_tol=pos_tol,
-                max_step_size=max_step_size,
-            )
-
-        monkeypatch.setattr(RRT, "_init_rrt_fields", init_rrt_fields_with_goal_sample)
+        _force_rrt_goal_sampling(monkeypatch)
 
     planner_obj = planner_cls(franka)
     envs_idx = torch.tensor([1], dtype=gs.tc_int, device=gs.device)
@@ -1080,7 +569,6 @@ def test_direct_planner_with_entity_restores_full_runtime_for_selected_env_query
         envs_idx=envs_idx,
         ee_link_idx=franka.get_link("hand").idx,
         obj_entity=cube,
-        restore_state=True,
     )
 
     _assert_plan_valid(~is_invalid)
@@ -1095,35 +583,14 @@ def test_direct_planner_with_entity_restores_full_runtime_for_selected_env_query
 def test_direct_planner_with_entity_restores_object_state(backend, planner, monkeypatch, tol):
     from genesis.utils.path_planning import RRT, RRTConnect
 
-    scene = gs.Scene(
-        rigid_options=gs.options.RigidOptions(
-            enable_collision=False,
-            enable_self_collision=False,
-            enable_joint_limit=False,
-            disable_constraint=True,
-            use_contact_island=False,
-            use_hibernation=False,
-        ),
-        show_viewer=False,
-    )
+    scene = _make_planner_scene()
     cube = scene.add_entity(gs.morphs.Box(size=(0.05, 0.05, 0.05), pos=(0.30, 0.10, 0.35)))
     franka = scene.add_entity(gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml"))
     scene.build()
 
     planner_cls = {"RRT": RRT, "RRTConnect": RRTConnect}[planner]
     if planner == "RRT":
-        original_init_rrt_fields = RRT._init_rrt_fields
-
-        def init_rrt_fields_with_goal_sample(self, goal_bias=0.05, max_nodes=2000, pos_tol=5e-3, max_step_size=0.1):
-            original_init_rrt_fields(
-                self,
-                goal_bias=1.0,
-                max_nodes=max_nodes,
-                pos_tol=pos_tol,
-                max_step_size=max_step_size,
-            )
-
-        monkeypatch.setattr(RRT, "_init_rrt_fields", init_rrt_fields_with_goal_sample)
+        _force_rrt_goal_sampling(monkeypatch)
 
     cube_pos_before = cube.get_pos().clone()
     cube_quat_before = cube.get_quat().clone()
@@ -1147,7 +614,6 @@ def test_direct_planner_with_entity_restores_object_state(backend, planner, monk
         ignore_collision=True,
         ee_link_idx=franka.get_link("hand").idx,
         obj_entity=cube,
-        restore_state=True,
     )
 
     _assert_plan_valid(~is_invalid)
@@ -1157,18 +623,180 @@ def test_direct_planner_with_entity_restores_object_state(backend, planner, monk
     assert_allclose(cube.get_dofs_velocity(), cube_vel_before, tol=tol)
 
 
+@pytest.mark.required
 @pytest.mark.cache(False)
 @pytest.mark.parametrize("planner", ["RRT", "RRTConnect"])
 @pytest.mark.parametrize("backend", [gs.cpu])
-def test_direct_planner_restore_state_false_leaves_mutations(backend, planner, monkeypatch, tol):
+def test_direct_planner_restores_state_when_planner_raises(backend, planner, monkeypatch, tol):
+    """When the planner raises mid-loop, `_planning_transaction` must restore live state and
+    re-raise the original exception. Regression test for the bug where `sys.exc_info()` in the
+    `finally` could mistake an outer exception for an in-flight planner exception and silently
+    swallow restore failures."""
     from genesis.utils.path_planning import RRT, RRTConnect
+
+    scene = _make_planner_scene()
+    cube = scene.add_entity(gs.morphs.Box(size=(0.05, 0.05, 0.05), pos=(0.30, 0.10, 0.35)))
+    franka = scene.add_entity(gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml"))
+    scene.build()
+
+    planner_cls = {"RRT": RRT, "RRTConnect": RRTConnect}[planner]
+    cube_pos_before = cube.get_pos().clone()
+    robot_qpos_before = franka.get_qpos().clone()
+
+    class _Boom(RuntimeError):
+        pass
+
+    def explode_after_mutation(self, *args, **kwargs):
+        cube.set_pos(cube_pos_before + torch.tensor([0.01, 0.0, 0.0], device=gs.device))
+        self._entity.set_qpos(robot_qpos_before + 0.05, zero_velocity=False)
+        raise _Boom("planner blew up mid-loop")
+
+    monkeypatch.setattr(planner_cls, "get_exclude_geom_pairs", explode_after_mutation)
+
+    planner_obj = planner_cls(franka)
+    with pytest.raises(_Boom):
+        planner_obj.plan(
+            qpos_goal=START_QPOS,
+            qpos_start=START_QPOS,
+            max_nodes=8,
+            num_waypoints=8,
+            smooth_path=False,
+            ignore_collision=True,
+            ee_link_idx=franka.get_link("hand").idx,
+            obj_entity=cube,
+        )
+
+    assert_allclose(franka.get_qpos(), robot_qpos_before, tol=tol)
+    assert_allclose(cube.get_pos(), cube_pos_before, tol=tol)
+
+
+@pytest.mark.cache(False)
+@pytest.mark.parametrize("planner", ["RRT", "RRTConnect"])
+@pytest.mark.parametrize("backend", [gs.cpu])
+def test_direct_planner_does_not_swallow_restore_failure_inside_caller_except_block(
+    backend, planner, monkeypatch, tol
+):
+    """Regression test for the `sys.exc_info()` bug: calling `plan()` from inside the caller's
+    own `except` block must NOT make a restore failure look like an in-flight planner exception.
+    A restore failure on normal return must propagate, even when an outer exception is active."""
+    from genesis.utils.path_planning import RRT, RRTConnect
+
+    scene = _make_planner_scene()
+    cube = scene.add_entity(gs.morphs.Box(size=(0.05, 0.05, 0.05), pos=(0.30, 0.10, 0.35)))
+    franka = scene.add_entity(gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml"))
+    scene.build()
+
+    planner_cls = {"RRT": RRT, "RRTConnect": RRTConnect}[planner]
+    if planner == "RRT":
+        _force_rrt_goal_sampling(monkeypatch)
+
+    def fail_restore_entity_state(self, *args, **kwargs):
+        raise RuntimeError("restore_entity_state failed")
+
+    monkeypatch.setattr(planner_cls, "restore_entity_state", fail_restore_entity_state)
+    planner_obj = planner_cls(franka)
+
+    # Simulate a caller wrapping plan() in its own except block. The active outer exception must
+    # not cause `_planning_transaction` to demote the restore failure to a warning.
+    try:
+        raise ValueError("outer error from caller")
+    except ValueError:
+        with pytest.raises(RuntimeError, match="restore_entity_state failed"):
+            planner_obj.plan(
+                qpos_goal=START_QPOS,
+                qpos_start=START_QPOS,
+                max_nodes=8,
+                num_waypoints=8,
+                smooth_path=False,
+                ignore_collision=True,
+                ee_link_idx=franka.get_link("hand").idx,
+                obj_entity=cube,
+            )
+
+
+@pytest.mark.cache(False)
+@pytest.mark.parametrize("backend", [gs.cpu])
+def test_direct_planner_baseexception_in_restore_wins_over_exception(backend, monkeypatch):
+    """When NO planner exception is in flight but two restore steps fail — a regular Exception
+    AND a BaseException-non-Exception (e.g. KeyboardInterrupt) — the BaseException must win and
+    propagate, regardless of which fired first."""
+    from genesis.utils.path_planning import RRT
+
+    scene = _make_planner_scene()
+    cube = scene.add_entity(gs.morphs.Box(size=(0.05, 0.05, 0.05), pos=(0.30, 0.10, 0.35)))
+    franka = scene.add_entity(gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml"))
+    scene.build()
+
+    def fail_object_restore(self, *args, **kwargs):
+        raise RuntimeError("object restore failed first")
+
+    def signal_during_collider_restore(self, *args, **kwargs):
+        raise KeyboardInterrupt("simulated signal after object restore failure")
+
+    monkeypatch.setattr(RRT, "restore_entity_state", fail_object_restore)
+    monkeypatch.setattr(RRT, "restore_collider_state", signal_during_collider_restore)
+
+    planner_obj = RRT(franka)
+    with pytest.raises(KeyboardInterrupt):
+        planner_obj.plan(
+            qpos_goal=START_QPOS,
+            qpos_start=START_QPOS,
+            max_nodes=8,
+            num_waypoints=8,
+            smooth_path=False,
+            ignore_collision=True,
+            ee_link_idx=franka.get_link("hand").idx,
+            obj_entity=cube,
+        )
+
+
+@pytest.mark.cache(False)
+@pytest.mark.parametrize("backend", [gs.cpu])
+def test_direct_planner_does_not_drop_planner_error_on_baseexception_in_restore(backend, monkeypatch):
+    """If a restore step raises `BaseException`-non-`Exception` (e.g. KeyboardInterrupt) AFTER the
+    planner already raised, the in-flight planner exception must not be silently replaced — the
+    planner exception is the diagnostic info the user needs."""
+    from genesis.utils.path_planning import RRT
+
+    scene = _make_planner_scene()
+    cube = scene.add_entity(gs.morphs.Box(size=(0.05, 0.05, 0.05), pos=(0.30, 0.10, 0.35)))
+    franka = scene.add_entity(gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml"))
+    scene.build()
+
+    class _PlannerBoom(RuntimeError):
+        pass
+
+    def explode_after_mutation(self, *args, **kwargs):
+        raise _PlannerBoom("planner failed")
+
+    def restore_via_signal(self, *args, **kwargs):
+        raise KeyboardInterrupt("simulated signal during restore")
+
+    monkeypatch.setattr(RRT, "get_exclude_geom_pairs", explode_after_mutation)
+    monkeypatch.setattr(RRT, "restore_entity_state", restore_via_signal)
+
+    planner_obj = RRT(franka)
+    with pytest.raises(KeyboardInterrupt):
+        planner_obj.plan(
+            qpos_goal=START_QPOS,
+            qpos_start=START_QPOS,
+            max_nodes=8,
+            num_waypoints=8,
+            smooth_path=False,
+            ignore_collision=True,
+            ee_link_idx=franka.get_link("hand").idx,
+            obj_entity=cube,
+        )
+
+
+@pytest.mark.cache(False)
+@pytest.mark.parametrize("backend", [gs.cpu])
+def test_direct_planner_restores_eq_const_info_cache_end_to_end(backend, monkeypatch, tol):
+    """End-to-end CPU coverage of `_eq_const_info_cache` save/clear/restore through `plan()`."""
+    from genesis.utils.path_planning import RRTConnect
 
     scene = gs.Scene(
         rigid_options=gs.options.RigidOptions(
-            enable_collision=False,
-            enable_self_collision=False,
-            enable_joint_limit=False,
-            disable_constraint=True,
             use_contact_island=False,
             use_hibernation=False,
         ),
@@ -1178,53 +806,20 @@ def test_direct_planner_restore_state_false_leaves_mutations(backend, planner, m
     franka = scene.add_entity(gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml"))
     scene.build()
 
-    planner_cls = {"RRT": RRT, "RRTConnect": RRTConnect}[planner]
-    if planner == "RRT":
-        original_init_rrt_fields = RRT._init_rrt_fields
+    constraint_solver = scene.rigid_solver.constraint_solver
+    cache_key = ("eq_const_info_cache_round_trip", False)
+    cache_value = object()
+    constraint_solver._eq_const_info_cache[cache_key] = cache_value
 
-        def init_rrt_fields_with_goal_sample(self, goal_bias=0.05, max_nodes=2000, pos_tol=5e-3, max_step_size=0.1):
-            original_init_rrt_fields(
-                self,
-                goal_bias=1.0,
-                max_nodes=max_nodes,
-                pos_tol=pos_tol,
-                max_step_size=max_step_size,
-            )
-
-        monkeypatch.setattr(RRT, "_init_rrt_fields", init_rrt_fields_with_goal_sample)
-
-    mutated_pos = cube.get_pos().clone() + torch.tensor([0.01, 0.0, 0.0], device=gs.device)
-    mutated_quat = torch.tensor([0.9238795, 0.0, 0.3826834, 0.0], dtype=gs.tc_float, device=gs.device)
-    mutated_velocity = torch.ones_like(cube.get_dofs_velocity())
-    errno = qd_to_torch(scene.rigid_solver._errno, copy=False)
-    errno.fill_(3)
-
-    def fail_restore_state_helper(*args, **kwargs):
-        raise AssertionError("restore_state=False must not use planner state snapshot/restore helpers")
-
-    for helper_name in (
-        "snapshot_entity_state",
-        "snapshot_hibernation_state",
-        "snapshot_collider_state",
-        "snapshot_constraint_state",
-        "snapshot_errno_state",
-        "restore_entity_state",
-        "restore_planning_state",
-    ):
-        monkeypatch.setattr(planner_cls, helper_name, fail_restore_state_helper)
-
-    def dirty_get_exclude_geom_pairs(self, *args, **kwargs):
-        cube.set_pos(mutated_pos)
-        cube.set_quat(mutated_quat)
-        cube.set_dofs_velocity(mutated_velocity)
-        errno.fill_(7)
+    def dirty_cache(self, *args, **kwargs):
+        constraint_solver._eq_const_info_cache.clear()
+        constraint_solver._eq_const_info_cache[("dirty",)] = "stale"
         return torch.empty((0, 2), dtype=gs.tc_int, device=gs.device)
 
-    monkeypatch.setattr(planner_cls, "get_exclude_geom_pairs", dirty_get_exclude_geom_pairs)
-    monkeypatch.setattr(planner_cls, "update_object", lambda *args, **kwargs: None)
+    monkeypatch.setattr(RRTConnect, "get_exclude_geom_pairs", dirty_cache)
 
-    planner_obj = planner_cls(franka)
-    path, is_invalid = planner_obj.plan(
+    planner_obj = RRTConnect(franka)
+    planner_obj.plan(
         qpos_goal=START_QPOS,
         qpos_start=START_QPOS,
         max_nodes=8,
@@ -1233,15 +828,10 @@ def test_direct_planner_restore_state_false_leaves_mutations(backend, planner, m
         ignore_collision=True,
         ee_link_idx=franka.get_link("hand").idx,
         obj_entity=cube,
-        restore_state=False,
     )
 
-    _assert_plan_valid(~is_invalid)
-    assert path.shape[-1] == franka.n_qs
-    assert torch.equal(errno, torch.full_like(errno, 7))
-    assert_allclose(cube.get_pos(), mutated_pos, tol=tol)
-    assert_allclose(cube.get_quat(), mutated_quat, tol=1e-7)
-    assert_allclose(cube.get_dofs_velocity(), mutated_velocity, tol=tol)
+    assert constraint_solver._eq_const_info_cache.get(cache_key) is cache_value
+    assert ("dirty",) not in constraint_solver._eq_const_info_cache
 
 
 @pytest.mark.cache(False)
@@ -1408,7 +998,7 @@ def test_direct_planner_rejects_articulated_object_attachment(backend, planner):
     scene.build()
     planner_obj = {"RRT": RRT, "RRTConnect": RRTConnect}[planner](franka)
 
-    with pytest.raises(gs.GenesisException, match="only non-articulated object"):
+    with pytest.raises(gs.GenesisException, match="non-articulated"):
         planner_obj.plan(
             qpos_goal=START_QPOS,
             ee_link_idx=franka.get_link("hand").idx,
@@ -1493,11 +1083,81 @@ def test_plan_path_rejects_partial_object_attachment_args(backend):
     franka = scene.add_entity(gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml"))
     scene.build()
 
-    with pytest.raises(gs.GenesisException, match="with_entity"):
+    with pytest.raises(gs.GenesisException, match="must be specified together"):
         franka.plan_path(qpos_goal=START_QPOS, ee_link_name="hand")
 
-    with pytest.raises(gs.GenesisException, match="reference link"):
+    with pytest.raises(gs.GenesisException, match="must be specified together"):
         franka.plan_path(qpos_goal=START_QPOS, with_entity=cube)
+
+
+@pytest.mark.cache(False)
+@pytest.mark.parametrize("backend", [gs.cpu])
+def test_plan_path_rejects_with_entity_self(backend):
+    scene = gs.Scene(show_viewer=False)
+    franka = scene.add_entity(gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml"))
+    scene.build()
+
+    with pytest.raises(gs.GenesisException, match="cannot be the planning entity itself"):
+        franka.plan_path(qpos_goal=START_QPOS, ee_link_name="hand", with_entity=franka)
+
+
+@pytest.mark.cache(False)
+@pytest.mark.parametrize("backend", [gs.cpu])
+def test_plan_path_rejects_negative_max_retry(backend):
+    """`max_retry < 0` would skip the planner loop entirely and return an uninitialized path."""
+    scene = gs.Scene(show_viewer=False)
+    franka = scene.add_entity(gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml"))
+    scene.build()
+
+    with pytest.raises(gs.GenesisException, match="max_retry"):
+        franka.plan_path(qpos_goal=START_QPOS, max_retry=-1)
+
+
+@pytest.mark.cache(False)
+@pytest.mark.parametrize("backend", [gs.cpu])
+def test_plan_path_rejects_non_positive_num_waypoints(backend):
+    """`num_waypoints < 1` produces a zero-size output and crashes inside `align_waypoints_length`
+    when the planner succeeds; reject up front."""
+    scene = gs.Scene(show_viewer=False)
+    franka = scene.add_entity(gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml"))
+    scene.build()
+
+    with pytest.raises(gs.GenesisException, match="num_waypoints"):
+        franka.plan_path(qpos_goal=START_QPOS, num_waypoints=0)
+
+
+@pytest.mark.cache(False)
+@pytest.mark.parametrize("backend", [gs.cpu])
+def test_sanitize_envs_idx_rejects_mixed_bool_int_list(backend):
+    """A list mixing bool and int is ambiguous: a strict-int call would coerce True→1, silently
+    changing user intent. Reject explicitly instead."""
+    scene = gs.Scene(show_viewer=False)
+    scene.add_entity(gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml"))
+    scene.build(n_envs=2)
+
+    with pytest.raises(gs.GenesisException, match="Mixing bool and int"):
+        scene._sanitize_envs_idx([True, 0])
+
+
+@pytest.mark.cache(False)
+@pytest.mark.parametrize("planner", ["RRT", "RRTConnect"])
+@pytest.mark.parametrize("backend", [gs.cpu])
+def test_direct_planner_rejects_obj_entity_is_self(backend, planner):
+    """Direct-planner counterpart of the wrapper's `with_entity is self` check."""
+    from genesis.utils.path_planning import RRT, RRTConnect
+
+    scene = gs.Scene(show_viewer=False)
+    franka = scene.add_entity(gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml"))
+    scene.build()
+
+    planner_cls = {"RRT": RRT, "RRTConnect": RRTConnect}[planner]
+    planner_obj = planner_cls(franka)
+    with pytest.raises(gs.GenesisException, match="cannot be the planning entity itself"):
+        planner_obj.plan(
+            qpos_goal=START_QPOS,
+            ee_link_idx=franka.get_link("hand").idx,
+            obj_entity=franka,
+        )
 
 
 @pytest.mark.cache(False)
@@ -1516,7 +1176,7 @@ def test_plan_path_rejects_articulated_object_attachment_before_snapshot(backend
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("validation must run before snapshot")),
     )
 
-    with pytest.raises(gs.GenesisException, match="only non-articulated object"):
+    with pytest.raises(gs.GenesisException, match="non-articulated"):
         franka.plan_path(
             qpos_goal=START_QPOS,
             ee_link_name="hand",
@@ -1638,23 +1298,6 @@ def test_restore_collider_state_clears_contact_cache(backend):
 
 @pytest.mark.cache(False)
 @pytest.mark.parametrize("backend", [gs.cpu])
-def test_snapshot_collider_state_uses_runtime_allowlist(backend):
-    from genesis.utils.path_planning import RRT
-
-    scene = gs.Scene(show_viewer=False)
-    anchor, _ = _add_restore_test_entities(scene)
-    planner = RRT(anchor)
-    collider_state = scene.rigid_solver.collider._collider_state
-
-    snapshot = planner.snapshot_collider_state()
-    snapshot_ids = {id(tensor) for tensor, _ in snapshot}
-    expected_ids = _base_collider_snapshot_ids(planner, collider_state)
-
-    assert snapshot_ids == expected_ids
-
-
-@pytest.mark.cache(False)
-@pytest.mark.parametrize("backend", [gs.cpu])
 def test_snapshot_collider_state_excludes_rebuilt_collision_scratch_buffers(backend):
     from genesis.utils.path_planning import RRT
 
@@ -1720,62 +1363,10 @@ def test_snapshot_collider_state_excludes_reinitialized_collision_scratch(backen
 
 @pytest.mark.cache(False)
 @pytest.mark.parametrize("backend", [gs.cpu])
-def test_snapshot_collider_state_keeps_hibernation_buffers_as_rebuilt_scratch(backend):
-    from genesis.utils.path_planning import RRT
-
-    scene = gs.Scene(show_viewer=False)
-    anchor, _ = _add_restore_test_entities(scene)
-    planner = RRT(anchor)
-    planner._solver._use_hibernation = True
-    collider_state = scene.rigid_solver.collider._collider_state
-
-    snapshot = planner.snapshot_collider_state()
-    snapshot_ids = {id(tensor) for tensor, _ in snapshot}
-    expected_ids = _base_collider_snapshot_ids(planner, collider_state)
-
-    assert snapshot_ids == expected_ids
-
-
-@pytest.mark.cache(False)
-@pytest.mark.parametrize("backend", [gs.cpu])
-def test_snapshot_hibernation_state_follows_setter_wakeup_condition(backend):
-    from genesis.utils.path_planning import RRT
-
-    scene = gs.Scene(
-        rigid_options=gs.options.RigidOptions(
-            enable_collision=False,
-            enable_self_collision=False,
-            enable_joint_limit=False,
-            use_contact_island=False,
-            use_hibernation=True,
-        ),
-        show_viewer=False,
-    )
-    anchor, _ = _add_restore_test_entities(scene)
-    planner = RRT(anchor)
-
-    assert not planner._solver._use_hibernation
-    assert planner._solver._options.use_hibernation
-    assert planner.snapshot_hibernation_state() is not None
-
-
-@pytest.mark.cache(False)
-@pytest.mark.parametrize("backend", [gs.cpu])
 def test_snapshot_collider_state_restores_grad_contact_input(backend):
     from genesis.utils.path_planning import RRT
 
-    scene = gs.Scene(
-        sim_options=gs.options.SimOptions(requires_grad=True),
-        rigid_options=gs.options.RigidOptions(
-            enable_collision=False,
-            enable_self_collision=False,
-            enable_joint_limit=False,
-            disable_constraint=True,
-            use_contact_island=False,
-            use_hibernation=False,
-        ),
-        show_viewer=False,
-    )
+    scene = _make_planner_scene(requires_grad=True)
     anchor, _ = _add_restore_test_entities(scene)
     planner = RRT(anchor)
     collider_state = scene.rigid_solver.collider._collider_state
@@ -1786,113 +1377,6 @@ def test_snapshot_collider_state_restores_grad_contact_input(backend):
     expected_ids.update(id(tensor) for tensor in planner.iter_state_tensors(collider_state.diff_contact_input))
 
     assert snapshot_ids == expected_ids
-
-
-@pytest.mark.cache(False)
-@pytest.mark.parametrize("backend", [gs.cpu])
-def test_restore_planning_state_continues_after_robot_restore_failure(backend, monkeypatch):
-    from genesis.utils.path_planning import RRT
-
-    scene = gs.Scene(show_viewer=False)
-    anchor, cube = _add_restore_test_entities(scene)
-    planner = RRT(anchor)
-
-    qpos_cur = anchor.get_qpos().clone()
-    obj_state = planner.snapshot_entity_state(cube, envs_idx=None)
-    collider_state = planner.snapshot_collider_state()
-    calls = []
-
-    def fail_robot_restore(*args, **kwargs):
-        calls.append("robot")
-        raise RuntimeError("robot restore failed")
-
-    def restore_object(*args, **kwargs):
-        calls.append("object")
-
-    def restore_collider(*args, **kwargs):
-        calls.append("collider")
-
-    monkeypatch.setattr(anchor, "set_qpos", fail_robot_restore)
-    monkeypatch.setattr(planner, "restore_entity_state", restore_object)
-    monkeypatch.setattr(planner, "restore_collider_state", restore_collider)
-
-    with pytest.raises(RuntimeError, match="robot restore failed"):
-        planner.restore_planning_state(
-            qpos_cur, envs_idx=None, obj_entity=cube, obj_state=obj_state, collider_state=collider_state
-        )
-
-    assert calls == ["robot", "object", "collider"]
-
-
-@pytest.mark.cache(False)
-@pytest.mark.parametrize("backend", [gs.cpu])
-def test_restore_planning_state_raises_restore_error_from_planner_error(backend, monkeypatch):
-    from genesis.utils.path_planning import PlannerStateRestoreError, RRT
-
-    scene = gs.Scene(show_viewer=False)
-    anchor, _ = _add_restore_test_entities(scene)
-    planner = RRT(anchor)
-    planner_error = RuntimeError("planner failed")
-
-    def fail_robot_restore(*args, **kwargs):
-        raise RuntimeError("robot restore failed")
-
-    monkeypatch.setattr(anchor, "set_qpos", fail_robot_restore)
-
-    with pytest.raises(PlannerStateRestoreError, match="robot qpos: robot restore failed") as exc_info:
-        planner.restore_planning_state(anchor.get_qpos().clone(), envs_idx=None, planner_error=planner_error)
-
-    assert exc_info.value.__cause__ is planner_error
-    if hasattr(planner_error, "add_note"):
-        assert any(
-            "Planner state restore failed after planner error: robot qpos: robot restore failed" in note
-            for note in getattr(planner_error, "__notes__", [])
-        )
-
-
-@pytest.mark.cache(False)
-@pytest.mark.parametrize("backend", [gs.cpu])
-def test_restore_planning_state_does_not_mask_baseexception_control_flow(backend, monkeypatch):
-    from genesis.utils.path_planning import RRT
-
-    scene = gs.Scene(show_viewer=False)
-    anchor, _ = _add_restore_test_entities(scene)
-    planner = RRT(anchor)
-    planner_error = KeyboardInterrupt()
-
-    def fail_robot_restore(*args, **kwargs):
-        raise RuntimeError("robot restore failed")
-
-    monkeypatch.setattr(anchor, "set_qpos", fail_robot_restore)
-
-    planner.restore_planning_state(anchor.get_qpos().clone(), envs_idx=None, planner_error=planner_error)
-
-
-@pytest.mark.cache(False)
-@pytest.mark.parametrize("backend", [gs.cpu])
-def test_restore_planning_state_restores_hibernation_bookkeeping(backend):
-    from genesis.utils.path_planning import RRT
-
-    scene = gs.Scene(show_viewer=False)
-    anchor, _ = _add_restore_test_entities(scene)
-    planner = RRT(anchor)
-    planner._solver._use_hibernation = True
-
-    contact_island_state = planner._solver.constraint_solver.contact_island.contact_island_state
-    hibernation_state = planner.snapshot_hibernation_state()
-    assert hibernation_state
-    assert any(
-        tensor is contact_island_state.entity_idx_to_next_entity_idx_in_hibernated_island
-        for tensor, _ in hibernation_state
-    )
-    assert any(tensor is planner._solver.geoms_state.min_buffer_idx for tensor, _ in hibernation_state)
-    assert any(tensor is planner._solver.geoms_state.max_buffer_idx for tensor, _ in hibernation_state)
-    for tensor, _ in hibernation_state:
-        qd_to_torch(tensor, copy=False).fill_(7)
-
-    planner.restore_planning_state(anchor.get_qpos().clone(), envs_idx=None, hibernation_state=hibernation_state)
-
-    _assert_qd_state_matches(hibernation_state)
 
 
 @pytest.mark.cache(False)
